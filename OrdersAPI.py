@@ -2,8 +2,10 @@ import boto3
 import requests
 import json     
 client = boto3.client('apigateway')
-
-
+import uuid
+import random
+import datetime
+import time 
 restApiId='zuiz4od611'
 
 # CALL API GATEWAY OF THIS API: arn:aws:execute-api:us-east-1:553509088460:zuiz4od611/*/GET/users/{user_id}
@@ -28,6 +30,7 @@ def create_order(order):
     response = requests.post(api_gateway_url, json=order)
     if response.status_code == 201:
         data = response.json()
+        print("[Order Created]:", order['StockID'], order['UserID'],order['Mode'], order['NumOfShares'], order['UUID'])
         print(data)
         return data['message']
     else:
@@ -35,7 +38,33 @@ def create_order(order):
         print(response.json())
         return None
     
+def batch_order_generator(num):
+    for i in range(num):
 
+        order = {
+            "UUID": str(uuid.uuid4()),
+            "StockID": str(random.choice([1,2])),
+            "UserID": random.choice(["user1","user2", "user3"]),
+            "CreatedAt": str(datetime.datetime.now()),
+            "Mode": random.choice(["Sell","Buy"]),
+            "NumOfShares": random.randint(1,50),
+            "Price": 100
+        }
+        create_order(order)
+
+def batch_order_generator_NVIDIA(num):
+    for i in range(num):
+
+        order = {
+            "UUID": str(uuid.uuid4()),
+            "StockID": "1",
+            "UserID": random.choice(["user1","user2", "user3"]),
+            "CreatedAt": str(datetime.datetime.now()),
+            "Mode": random.choice(["Sell","Buy"]),
+            "NumOfShares": random.randint(1,50),
+            "Price": 100
+        }
+        create_order(order)
 order130 = {
   
   
@@ -65,3 +94,5 @@ def get_order(order_id):
 # get_user("user1")
 
 # get_order("order123")
+if '__name__' == '__main__':
+    batch_order_generator(5)

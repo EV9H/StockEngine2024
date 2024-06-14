@@ -2,7 +2,7 @@ import boto3
 import json
 from botocore.exceptions import ClientError
 import logging
-
+from OrdersAPI import batch_order_generator, batch_order_generator_NVIDIA
 SQS_URL = { 
     "APPL_SELL": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_SELL_SQS",
     "APPL_BUY": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_BUY_SQS",
@@ -11,10 +11,10 @@ SQS_URL = {
 }
 logger = logging.getLogger(__name__)
 sqs = boto3.resource("sqs")
-
+dynamodb = boto3.resource('dynamodb')
 # CONFIG
 
-SQS_MAX_WAIT = 20
+SQS_MAX_WAIT = 2
 
 SQS_MAX_MSG_NUMBER = 5
 
@@ -88,7 +88,28 @@ def delete_messages(queue, messages):
         logger.exception("Couldn't delete messages from queue %s", queue)
     else:
         return response
+def send_message(queue, message_body, message_attributes=None):
+    """
+    Send a message to an Amazon SQS queue.
 
+    :param queue: The queue that receives the message.
+    :param message_body: The body text of the message.
+    :param message_attributes: Custom attributes of the message. These are key-value
+                               pairs that can be whatever you want.
+    :return: The response from SQS that contains the assigned message ID.
+    """
+    if not message_attributes:
+        message_attributes = {}
+
+    try:
+        response = queue.send_message(
+            MessageBody=message_body, MessageAttributes=message_attributes
+        )
+    except ClientError as error:
+        logger.exception("Send message failed: %s", message_body)
+        raise error
+    else:
+        return response
 # UUID = msg["UUID"]
 # StockID = msg["StockID"] 
 # UserID= msg["UserID"] 
@@ -108,39 +129,158 @@ class MatchingEngine:
     def receive_buy_order(self):
         try:
             messages = receive_messages(self.buy_sqs)
-
-
+            if len(messages) == 0:
+                print("Received 0 buy order")
+                return
             for message_raw in messages:
-                print(f"Received message: %s: %s", message_raw.message_id) # 
+                # print(f"Received message: %s: %s", message_raw.message_id) # 
                 msg = json.loads(json.loads(message_raw.body)["Message"]) # dict
                 self.buy_orders.append(msg)
                 print(f"Received buy order: {msg['UUID']}")
             # delete message from SQS 
-            delete_messages(self.buy_sqs, messages)
-            print(self.buy_orders)
+            if len(messages) > 0:
+                print("Deleting messages from Buy SQS...")
+                delete_messages(self.buy_sqs, messages)
+                # print(self.buy_orders)
         except ClientError as error:
-            print("Couldn't receive messages from queue: %s", queue)
+            print("Couldn't receive messages from queue")
             raise error
 
        
     def receive_sell_order(self):
-        messages = self.receive_message(self.sell_sqs)
-        for message_raw in messages:
-            msg = json.loads(json.loads(message_raw.body)["Message"]) # dict
-            self.sell_orders.append(msg)
-            print(f"Received sell order: {msg['UUID']}")
+        try:
+            messages = receive_messages(self.sell_sqs)
+            if len(messages) == 0:
+                print("Received 0 sell order")
+                return
+
+            for message_raw in messages:
+                # print(f"Received message: %s: %s", message_raw.message_id) # 
+                msg = json.loads(json.loads(message_raw.body)["Message"]) # dict
+                self.sell_orders.append(msg)
+                print(f"Received sell order: {msg['UUID']}")
+            # delete message from SQS 
+            if len(messages) > 0:
+                print("Deleting messages from Sell SQS...")
+                delete_messages(self.sell_sqs, messages)
+                # print(self.sell_orders)
             
-    def send_partial(msg, mode):
-        pass
+        except ClientError as error:
+            print("Couldn't receive messages from queue")
+            raise error
+    def match_orders(self):
+        
+        while self.buy_orders and self.sell_orders: # while both queues have orders
+            b = self.buy_orders.pop()
+            s = self.sell_orders.pop()
+            # if b["StockID"] == s["StockID"] and b["Price"] >= s["Price"]:
+            print("Matching orders...", b['UUID'], b['NumOfShares'],"|",s['UUID'] , s['NumOfShares'])
+            if b['NumOfShares'] > s['NumOfShares']: # sell fulfilled 
+                print("Sell Order Fulfilled")
 
-    def send_full(msg):
-        pass
+                shares_left = b['NumOfShares'] - s['NumOfShares']
 
+                # send fulfilled to sell
+                self.send_full(s)
+
+                # send partial to buy 
+                b['NumOfShares'] = shares_left
+                self.send_partial(b, 'Buy')
+            elif b['NumOfShares'] < s['NumOfShares']: # buy fulfilled
+                print("Buy Order Fulfilled")
+                shares_left = s['NumOfShares'] - b['NumOfShares']
+
+                # send fulfilled to buy
+                self.send_full(b)
+
+                # send partial to sell
+                s['NumOfShares'] = shares_left
+                self.send_partial(s, 'Sell')
+            else: # Both fulfilled
+                print("Both Order Fulfilled")
+                self.send_full(b)
+                self.send_full(s)
+        else:
+            while self.buy_orders:
+                b = self.buy_orders.pop()
+                self.order_return(b, 'Buy')
+            while self.sell_orders:
+                s = self.sell_orders.pop()
+                self.order_return(s, 'Sell')
+            print("Not enough order to fulfill")
+    def order_return(self, msg, mode):
+        if mode == 'Sell':
+            send_message(self.sell_sqs , json.dumps({
+                'Message': json.dumps(msg)
+            }))
+        else:
+            send_message(self.buy_sqs , json.dumps({
+                'Message': json.dumps(msg)
+            }))
+    def send_partial(self, msg, mode):
+        # send back to queue
+        if mode == 'Sell': 
+            send_message(self.sell_sqs , json.dumps({
+                'Message': json.dumps(msg)
+            }))
+
+        else: 
+            send_message(self.buy_sqs , json.dumps({
+                'Message': json.dumps(msg)
+            }))
+
+        # update DB
+        table = dynamodb.Table('Orders')
+        try:
+            response = table.update_item(Key = { "UUID": msg['UUID']} ,
+                                        UpdateExpression="set NumOfShares=:N, #st=:S",
+                                        ExpressionAttributeValues={":N": msg['NumOfShares'], ":S": "Partial"},
+                                        ExpressionAttributeNames={
+                                            "#st": "Status"             # workaround for conflicting reserved key word 
+                                        },
+                                        ReturnValues="UPDATED_NEW"   
+                                    )
+        except ClientError as err:
+            print(
+                "Couldn't update. Here's why:",
+                err.response["Error"]["Code"],
+                err.response["Error"]["Message"],
+            )
+            raise
+        else:
+            return response["Attributes"]
+    def send_full(self, msg):
+        table = dynamodb.Table('Orders')
+        try:
+            response = table.update_item(Key = { "UUID": msg['UUID']} ,
+                                        UpdateExpression="set NumOfShares=:N, #st=:S",
+                                        ExpressionAttributeValues={":N": 0, ":S": "Fulfilled"},
+                                        ExpressionAttributeNames={
+                                            "#st": "Status"             # workaround for conflicting reserved key word 
+                                        },
+                                        ReturnValues="UPDATED_NEW",    
+                                    )
+        except ClientError as err:
+            print(
+                "Couldn't update. Here's why:",
+                err.response["Error"]["Code"],
+                err.response["Error"]["Message"],
+            )
+            raise
+        else:
+            return response["Attributes"]
+    def run(self, iteration = 10):
+        for i in range(iteration):
+            print("*********** Iteration", i, "***********")
+            print("Receiving Buy Orders ...")
+            self.receive_buy_order()
+            print("Receiving Sell Orders ...")
+            self.receive_sell_order()
+            self.match_orders()
+print("Generating Orders... ")
+batch_order_generator_NVIDIA(15)
+print("*"*40)
 print("initializing NVIDIA Matching Engine...")
 NVIDIA_MATCHER = MatchingEngine("NVIDIA")
 
-print("receiving buy order ... ")
-NVIDIA_MATCHER.receive_buy_order()
-print("receiving sell order ... ")
-
-# NVIDIA_MATCHER.receive_sell_order()
+NVIDIA_MATCHER.run(iteration=15)
