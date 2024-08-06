@@ -2,7 +2,6 @@ import boto3
 import json
 from botocore.exceptions import ClientError
 import logging
-from OrdersAPI import batch_order_generator, batch_order_generator_NVIDIA
 SQS_URL = { 
     "APPL_SELL": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_SELL_SQS",
     "APPL_BUY": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_BUY_SQS",
@@ -270,13 +269,17 @@ class MatchingEngine:
         else:
             return response["Attributes"]
     def run(self, iteration = 10):
-        for i in range(iteration):
+        i = 0 
+        while(True): 
+            
             print("*********** Iteration", i, "***********")
             print("Receiving Buy Orders ...")
             self.receive_buy_order()
             print("Receiving Sell Orders ...")
             self.receive_sell_order()
             self.match_orders()
+            i += 1
+            
 # print("Generating Orders... ")
 # batch_order_generator_NVIDIA(15)
 print("*"*40)
