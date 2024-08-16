@@ -117,6 +117,12 @@ def send_message(queue, message_body, message_attributes=None):
 # NumOfShares= msg["NumOfShares"] # int 
 # Price = msg["Price"]
 
+from decimal import Decimal
+
+import json
+import boto3
+from botocore.exceptions import ClientError
+from decimal import Decimal
 class MatchingEngine:
     def __init__(self, name):
         self.name = name
@@ -125,153 +131,111 @@ class MatchingEngine:
         self.buy_sqs = get_queue(name + "_BUY_SQS")
         self.sell_sqs = get_queue(name + "_SELL_SQS")
 
-
     def receive_buy_order(self):
-        try:
-            messages = receive_messages(self.buy_sqs)
-            if len(messages) == 0:
-                print("Received 0 buy order")
-                return
-            for message_raw in messages:
-                # print(f"Received message: %s: %s", message_raw.message_id) # 
-                msg = json.loads(json.loads(message_raw.body)["Message"]) # dict
-                self.buy_orders.append(msg)
-                print(f"Received buy order: {msg['UUID']}")
-            # delete message from SQS 
-            if len(messages) > 0:
-                print("Deleting messages from Buy SQS...")
-                delete_messages(self.buy_sqs, messages)
-                # print(self.buy_orders)
-        except ClientError as error:
-            print("Couldn't receive messages from queue")
-            raise error
+        messages = receive_messages(self.buy_sqs)
+        self.buy_orders.extend([self.parse_order(json.loads(json.loads(m.body)["Message"])) for m in messages])
+        if messages:
+            delete_messages(self.buy_sqs, messages)
+        print(f"Received {len(messages)} buy order(s)")
 
-       
     def receive_sell_order(self):
-        try:
-            messages = receive_messages(self.sell_sqs)
-            if len(messages) == 0:
-                print("Received 0 sell order")
-                return
+        messages = receive_messages(self.sell_sqs)
+        self.sell_orders.extend([self.parse_order(json.loads(json.loads(m.body)["Message"])) for m in messages])
+        if messages:
+            delete_messages(self.sell_sqs, messages)
+        print(f"Received {len(messages)} sell order(s)")
 
-            for message_raw in messages:
-                # print(f"Received message: %s: %s", message_raw.message_id) # 
-                msg = json.loads(json.loads(message_raw.body)["Message"]) # dict
-                self.sell_orders.append(msg)
-                print(f"Received sell order: {msg['UUID']}")
-            # delete message from SQS 
-            if len(messages) > 0:
-                print("Deleting messages from Sell SQS...")
-                delete_messages(self.sell_sqs, messages)
-                # print(self.sell_orders)
-            
-        except ClientError as error:
-            print("Couldn't receive messages from queue")
-            raise error
+    def parse_order(self, order):
+        order['Price'] = Decimal(order['Price'])
+        order['NumOfShares'] = int(order['NumOfShares'])
+        return order
+
     def match_orders(self):
+        self.buy_orders.sort(key=lambda x: (x['Price'], x['CreatedAt']), reverse=True)
+        self.sell_orders.sort(key=lambda x: (x['Price'], x['CreatedAt']))
         
-        while self.buy_orders and self.sell_orders: # while both queues have orders
-            b = self.buy_orders.pop()
-            s = self.sell_orders.pop()
-            # if b["StockID"] == s["StockID"] and b["Price"] >= s["Price"]:
-            print("Matching orders...", b['UUID'], b['NumOfShares'],"|",s['UUID'] , s['NumOfShares'])
-            if b['NumOfShares'] > s['NumOfShares']: # sell fulfilled 
-                print("Sell Order Fulfilled")
+        matches = 0
+        while self.buy_orders and self.sell_orders:
+            buy = self.buy_orders[0]
+            sell = self.sell_orders[0]
+            buy['Price'] = Decimal(str(buy['Price']))  # Convert string back to Decimal
+            sell['Price'] = Decimal(str(sell['Price']))  # Convert string back to Decimal
+            if buy['Price'] >= sell['Price']:
+                trade_price = (buy['Price'] + sell['Price']) / Decimal('2')
+                trade_shares = min(buy['NumOfShares'], sell['NumOfShares'])
+                
+                print(f"\nMatch found:")
+                print(f"  Buy:  {buy['UUID'][:8]} - {buy['NumOfShares']} shares @ ${buy['Price']:.2f}")
+                print(f"  Sell: {sell['UUID'][:8]} - {sell['NumOfShares']} shares @ ${sell['Price']:.2f}")
+                print(f"  Trade: {trade_shares} shares @ ${trade_price:.2f}")
+                
+                if buy['NumOfShares'] > sell['NumOfShares']:
+                    self.send_full(sell, str(trade_price))
+                    buy['NumOfShares'] -= trade_shares
+                    self.send_partial(buy, 'Buy', str(trade_price))
+                    self.sell_orders.pop(0)
+                    print(f"  Result: Sell order fulfilled, Buy order partially filled ({buy['NumOfShares']} shares remaining)")
+                elif buy['NumOfShares'] < sell['NumOfShares']:
+                    self.send_full(buy, str(trade_price))
+                    sell['NumOfShares'] -= trade_shares
+                    self.send_partial(sell, 'Sell', str(trade_price))
+                    self.buy_orders.pop(0)
+                    print(f"  Result: Buy order fulfilled, Sell order partially filled ({sell['NumOfShares']} shares remaining)")
+                else:
+                    self.send_full(buy, str(trade_price))
+                    self.send_full(sell, str(trade_price))
+                    self.buy_orders.pop(0)
+                    self.sell_orders.pop(0)
+                    print("  Result: Both orders fully matched and fulfilled")
+                
+                matches += 1
+            else:
+                break
+        
+        print(f"\nMatching complete. {matches} matches made.")
+        print(f"Remaining: {len(self.buy_orders)} buy orders, {len(self.sell_orders)} sell orders")
+        
+        for order in self.buy_orders:
+            self.order_return(order, 'Buy')
+        for order in self.sell_orders:
+            self.order_return(order, 'Sell')
+        self.buy_orders.clear()
+        self.sell_orders.clear()
 
-                shares_left = b['NumOfShares'] - s['NumOfShares']
-
-                # send fulfilled to sell
-                self.send_full(s)
-
-                # send partial to buy 
-                b['NumOfShares'] = shares_left
-                self.send_partial(b, 'Buy')
-            elif b['NumOfShares'] < s['NumOfShares']: # buy fulfilled
-                print("Buy Order Fulfilled")
-                shares_left = s['NumOfShares'] - b['NumOfShares']
-
-                # send fulfilled to buy
-                self.send_full(b)
-
-                # send partial to sell
-                s['NumOfShares'] = shares_left
-                self.send_partial(s, 'Sell')
-            else: # Both fulfilled
-                print("Both Order Fulfilled")
-                self.send_full(b)
-                self.send_full(s)
-        else:
-            while self.buy_orders:
-                b = self.buy_orders.pop()
-                self.order_return(b, 'Buy')
-            while self.sell_orders:
-                s = self.sell_orders.pop()
-                self.order_return(s, 'Sell')
-            print("Not enough order to fulfill")
     def order_return(self, msg, mode):
-        if mode == 'Sell':
-            send_message(self.sell_sqs , json.dumps({
-                'Message': json.dumps(msg)
-            }))
-        else:
-            send_message(self.buy_sqs , json.dumps({
-                'Message': json.dumps(msg)
-            }))
-    def send_partial(self, msg, mode):
-        # send back to queue
-        if mode == 'Sell': 
-            send_message(self.sell_sqs , json.dumps({
-                'Message': json.dumps(msg)
-            }))
+        queue = self.sell_sqs if mode == 'Sell' else self.buy_sqs
+        msg['Price'] = str(msg['Price'])  # Convert Decimal back to string
+        send_message(queue, json.dumps({'Message': json.dumps(msg)}))
+        print(f"Returned unmatched {mode} order: {msg['UUID'][:8]} - {msg['NumOfShares']} shares @ ${msg['Price']}")
 
-        else: 
-            send_message(self.buy_sqs , json.dumps({
-                'Message': json.dumps(msg)
-            }))
+    def send_partial(self, msg, mode, trade_price):
+        msg['Price'] = str(msg['Price'])  # Convert Decimal back to string
+        self.order_return(msg, mode)
+        self.update_order(msg['UUID'], msg['NumOfShares'], "Partial", trade_price)
+        print(f"Updated partial {mode} order: {msg['UUID'][:8]} - {msg['NumOfShares']} shares remaining")
 
-        # update DB
+    def send_full(self, msg, trade_price):
+        self.update_order(msg['UUID'], 0, "Fulfilled", trade_price)
+        print(f"Fulfilled order: {msg['UUID'][:8]} - {msg['NumOfShares']} shares @ ${msg['Price']}")
+
+    def update_order(self, uuid, shares, status, trade_price):
         table = dynamodb.Table('Orders')
         try:
-            response = table.update_item(Key = { "UUID": msg['UUID']} ,
-                                        UpdateExpression="set NumOfShares=:N, #st=:S",
-                                        ExpressionAttributeValues={":N": msg['NumOfShares'], ":S": "Partial"},
-                                        ExpressionAttributeNames={
-                                            "#st": "Status"             # workaround for conflicting reserved key word 
-                                        },
-                                        ReturnValues="UPDATED_NEW"   
-                                    )
-        except ClientError as err:
-            print(
-                "Couldn't update. Here's why:",
-                err.response["Error"]["Code"],
-                err.response["Error"]["Message"],
+            response = table.update_item(
+                Key={"UUID": uuid},
+                UpdateExpression="set NumOfShares=:N, #st=:S, TradePrice=:P",
+                ExpressionAttributeValues={":N": shares, ":S": status, ":P": trade_price},
+                ExpressionAttributeNames={"#st": "Status"},
+                ReturnValues="ALL_NEW"
             )
-            raise
-        else:
-            return response["Attributes"]
-    def send_full(self, msg):
-        table = dynamodb.Table('Orders')
-        try:
-            response = table.update_item(Key = { "UUID": msg['UUID']} ,
-                                        UpdateExpression="set NumOfShares=:N, #st=:S",
-                                        ExpressionAttributeValues={":N": 0, ":S": "Fulfilled"},
-                                        ExpressionAttributeNames={
-                                            "#st": "Status"             # workaround for conflicting reserved key word 
-                                        },
-                                        ReturnValues="UPDATED_NEW",    
-                                    )
+            print(f"Updated order in DynamoDB: {uuid[:8]} - Status: {status}, Shares: {shares}, TradePrice: {trade_price}")
         except ClientError as err:
-            print(
-                "Couldn't update. Here's why:",
-                err.response["Error"]["Code"],
-                err.response["Error"]["Message"],
-            )
+            print(f"Couldn't update order {uuid}. Error: {err.response['Error']['Message']}")
             raise
-        else:
-            return response["Attributes"]
-    def run(self, iteration = 10):
+
+    def run(self, iteration=10):
         for i in range(iteration):
-            print("*********** Iteration", i, "***********")
+            print(f"\n{'=' * 20} Iteration {i+1} {'=' * 20}")
             print("Receiving Buy Orders ...")
             self.receive_buy_order()
             print("Receiving Sell Orders ...")
@@ -283,4 +247,4 @@ print("*"*40)
 print("initializing NVIDIA Matching Engine...")
 NVIDIA_MATCHER = MatchingEngine("NVIDIA")
 
-NVIDIA_MATCHER.run(iteration=15)
+NVIDIA_MATCHER.run(iteration=100)
