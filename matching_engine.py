@@ -3,6 +3,9 @@ import json
 from botocore.exceptions import ClientError
 import logging
 from OrdersAPI import batch_order_generator, batch_order_generator_NVIDIA
+import time
+import uuid
+from datetime import datetime
 SQS_URL = { 
     "APPL_SELL": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_SELL_SQS",
     "APPL_BUY": "https://sqs.us-east-1.amazonaws.com/553509088460/APPL_BUY_SQS",
@@ -130,7 +133,18 @@ class MatchingEngine:
         self.sell_orders = []
         self.buy_sqs = get_queue(name + "_BUY_SQS")
         self.sell_sqs = get_queue(name + "_SELL_SQS")
-
+        self.kinesis_client = boto3.client('kinesis')
+        self.kinesis_stream_name = f"StockTradeStream"
+    def send_trade_to_kinesis(self, trade_data):
+        try:
+            response = self.kinesis_client.put_record(
+                StreamName=self.kinesis_stream_name,
+                Data=json.dumps(trade_data),
+                PartitionKey=trade_data['StockID']
+            )
+            print(f"Sent trade data to Kinesis: {trade_data['UUID'][:8]}")
+        except ClientError as e:
+            print(f"Error sending trade data to Kinesis: {e}")
     def receive_buy_order(self):
         messages = receive_messages(self.buy_sqs)
         self.buy_orders.extend([self.parse_order(json.loads(json.loads(m.body)["Message"])) for m in messages])
@@ -189,6 +203,19 @@ class MatchingEngine:
                     print("  Result: Both orders fully matched and fulfilled")
                 
                 matches += 1
+                trade_data = {
+                    'UUID': str(uuid.uuid4()),  # Generate a new UUID for the trade
+                    'BuyOrderID': buy['UUID'],
+                    'SellOrderID': sell['UUID'],
+                    'StockID': "1",  # Assuming both buy and sell orders have the same StockID
+                    'UserID': buy['UserID'],
+                    'SellerID': sell['UserID'],
+                    'NumOfShares': trade_shares,
+                    'Price': str(trade_price.quantize(Decimal('0.01'))),  # Round to 2 decimal places
+                    'Timestamp': datetime.now().isoformat(),
+                    'Type': 'Trade'
+                }
+                self.send_trade_to_kinesis(trade_data)
             else:
                 break
         
@@ -206,7 +233,7 @@ class MatchingEngine:
         queue = self.sell_sqs if mode == 'Sell' else self.buy_sqs
         msg['Price'] = str(msg['Price'])  # Convert Decimal back to string
         send_message(queue, json.dumps({'Message': json.dumps(msg)}))
-        print(f"Returned unmatched {mode} order: {msg['UUID'][:8]} - {msg['NumOfShares']} shares @ ${msg['Price']}")
+        # print(f"Returned unmatched {mode} order: {msg['UUID'][:8]} - {msg['NumOfShares']} shares @ ${msg['Price']}")
 
     def send_partial(self, msg, mode, trade_price):
         msg['Price'] = str(msg['Price'])  # Convert Decimal back to string
@@ -241,6 +268,7 @@ class MatchingEngine:
             print("Receiving Sell Orders ...")
             self.receive_sell_order()
             self.match_orders()
+            time.sleep(0.5)
 # print("Generating Orders... ")
 # batch_order_generator_NVIDIA(15)
 print("*"*40)
